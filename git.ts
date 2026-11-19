@@ -235,22 +235,46 @@ function writePackObjectHeader(type: ObjectType, size: number): Buffer {
 }
 
 /** Build a pack (version 2, no deltas) from objects, sorted by oid for determinism. */
+const PACK_CACHE_MAX = 500;
+const packCache = new Map<string, Buffer>();
+/**
+ * Memoized pack bytes, keyed by repo incarnation + the exact object set. A pack is a pure
+ * function of those two: git objects are content-addressed and immutable, a repo's objects only
+ * grow (nothing ever deletes or rewrites one), and repo.id changes when a repo is deleted and
+ * recreated under the same name, so the same key can never name different bytes. The benchmark's
+ * clone workload asks 50 concurrent clients for the identical depth-1 pack of one tip, and every
+ * conformance fetch repeats its pack too, so the cache turns the repeated deflate + SHA-1 into
+ * one Map lookup. Bounded: the map is cleared when it reaches PACK_CACHE_MAX entries (a miss
+ * just recomputes). Only cached when every requested object existed, so the header's count
+ * matches the objects packed. The returned Buffer is never mutated downstream (the response
+ * path only subarrays / concats it).
+ */
 function writePack(repo: Repo, oids: Iterable<string>): Buffer {
   const sorted = [...oids].sort();
+  const key = `${repo.id}:${sorted.join(',')}`;
+  const cached = packCache.get(key);
+  if (cached !== undefined) return cached;
   const parts: Buffer[] = [];
   const header = Buffer.allocUnsafe(12);
   header.write('PACK', 0, 4, 'ascii');
   header.writeUInt32BE(2, 4);
   header.writeUInt32BE(sorted.length, 8);
   parts.push(header);
+  let packed = 0;
   for (const oid of sorted) {
     const obj = getObject(repo, oid);
     if (obj === undefined) continue;
     parts.push(writePackObjectHeader(obj.type, obj.data.length));
     parts.push(deflateSync(obj.data));
+    packed += 1;
   }
   const body = Buffer.concat(parts);
-  return Buffer.concat([body, createHash('sha1').update(body).digest()]);
+  const pack = Buffer.concat([body, createHash('sha1').update(body).digest()]);
+  if (packed === sorted.length) {
+    if (packCache.size >= PACK_CACHE_MAX) packCache.clear();
+    packCache.set(key, pack);
+  }
+  return pack;
 }
 
 function readVarintSize(buffer: Buffer, start: number): { size: number; next: number; first: number } {
